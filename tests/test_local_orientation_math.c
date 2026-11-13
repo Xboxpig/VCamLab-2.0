@@ -1,4 +1,4 @@
-#include "../VCLocalOrientationMath.h"
+#include "../src/VCLocalOrientationMath.h"
 
 #include <assert.h>
 #include <math.h>

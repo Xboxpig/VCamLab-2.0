@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
                                            preferredFPS:(NSInteger * _Nullable)preferredFPS CF_RETURNS_RETAINED;
 - (BOOL)isReplacementActive;
 - (BOOL)isSystemPipelineReplacementConfigured;
+- (BOOL)isOBSPushSource;
 - (NSInteger)preferredFPS;
 - (CGFloat)jpegQuality;
 - (BOOL)aspectFill;

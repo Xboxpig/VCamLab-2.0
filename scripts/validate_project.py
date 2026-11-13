@@ -74,7 +74,7 @@ def validate_makefile() -> None:
         "Makefile",
     )
     source_names = set(
-        re.findall(r"[A-Za-z0-9_+.-]+\.(?:m|mm|x|xm|c|cpp)(?![A-Za-z0-9_.-])", makefile)
+        re.findall(r"[A-Za-z0-9_+./-]+\.(?:m|mm|x|xm|c|cpp)(?![A-Za-z0-9_.-])", makefile)
     )
     for source in source_names:
         if not (ROOT / source).is_file():
@@ -87,10 +87,10 @@ def validate_makefile() -> None:
 
 
 def validate_preferences() -> None:
-    implementation = read_text("VCPreferences.m")
-    header = read_text("VCPreferences.h")
+    implementation = read_text("src/VCPreferences.m")
+    header = read_text("src/VCPreferences.h")
     controller = read_text("prefs/VCPRootListController.m")
-    track_loader = read_text("VCMediaTrackLoader.h")
+    track_loader = read_text("src/VCMediaTrackLoader.h")
     bundle_makefile = read_text("prefs/Makefile")
     workflow = read_text(".github/workflows/test.yml")
     root = read_plist("prefs/Resources/Root.plist")
@@ -305,7 +305,7 @@ def validate_preferences() -> None:
         fail("stored preference types must be normalized before Root.plist loads")
     if "notify_cancel(" in controller or controller.count("notify_register_check(") != 1:
         fail("settings live polling must reuse process-lifetime Darwin notify tokens")
-    preference_validation = read_text("VCPreferenceValidation.h")
+    preference_validation = read_text("src/VCPreferenceValidation.h")
     preference_validation_test = read_text("tests/test_preference_validation.c")
     require(
         preference_validation,
@@ -399,15 +399,15 @@ def validate_injection_filters() -> None:
 
 
 def validate_zero_copy_bus() -> None:
-    header = read_text("VCSharedMediaBus.h")
-    protocol = read_text("VCSharedMediaProtocol.h")
-    bus = read_text("VCSharedMediaBus.m")
-    screen = read_text("VCScreenCaptureSource.m")
-    local = read_text("VCLocalMediaSource.m")
-    orientation = read_text("VCLocalOrientationMath.h")
-    network = read_text("AVAssetStreamAdapter.m")
-    network_header = read_text("AVAssetStreamAdapter.h")
-    coordinator = read_text("VCStreamCoordinator.m")
+    header = read_text("src/VCSharedMediaBus.h")
+    protocol = read_text("src/VCSharedMediaProtocol.h")
+    bus = read_text("src/VCSharedMediaBus.m")
+    screen = read_text("src/VCScreenCaptureSource.m")
+    local = read_text("src/VCLocalMediaSource.m")
+    orientation = read_text("src/VCLocalOrientationMath.h")
+    network = read_text("src/AVAssetStreamAdapter.m")
+    network_header = read_text("src/AVAssetStreamAdapter.h")
+    coordinator = read_text("src/VCStreamCoordinator.m")
     require(
         header + protocol + bus,
         (
@@ -633,15 +633,15 @@ def validate_zero_copy_bus() -> None:
 
 
 def validate_hooks_and_fail_open() -> None:
-    media = read_text("MediaServer.x")
-    tweak = read_text("Tweak.x")
-    coordinator = read_text("VCStreamCoordinator.m")
-    audio = read_text("VCAudioSampleConverter.m")
-    converter = read_text("VCFrameConverter.m")
+    media = read_text("src/MediaServer.x")
+    tweak = read_text("src/Tweak.x")
+    coordinator = read_text("src/VCStreamCoordinator.m")
+    audio = read_text("src/VCAudioSampleConverter.m")
+    converter = read_text("src/VCFrameConverter.m")
     all_source = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for pattern in ("*.m", "*.h", "*.x", "*.xm")
-        for path in ROOT.glob(pattern)
+        for path in (ROOT / "src").glob(pattern)
     )
     banned = {
         "device identity spoofing": r"%hook\s+AVCaptureDevice\b",
@@ -791,7 +791,7 @@ def validate_package_and_docs() -> None:
             "Package: com.murkaska.virtualcampro",
             "Architecture: iphoneos-arm64",
             "firmware (>= 15.0)",
-            "firmware (<< 16.0)",
+            "firmware (<< 17.0)",
         ),
         "Debian control",
     )
@@ -824,6 +824,7 @@ def validate_package_and_docs() -> None:
             fail("CHANGELOG has no section for the Debian package version")
 
     for relative in (
+        "control",
         "layout/DEBIAN/postinst",
         "layout/DEBIAN/postrm",
         "setup-config.sh",

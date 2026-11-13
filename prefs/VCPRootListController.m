@@ -10,10 +10,12 @@
 #import <notify.h>
 #import <os/lock.h>
 
-#import "../VCJPEGParser.h"
-#import "../VCMediaTrackLoader.h"
-#import "../VCPreferenceValidation.h"
-#import "../VCSharedMediaProtocol.h"
+#import "../src/VCJPEGParser.h"
+#import "../src/VCFrameConverter.h"
+#import "../src/VCOBSPushURL.h"
+#import "../src/VCMediaTrackLoader.h"
+#import "../src/VCPreferenceValidation.h"
+#import "../src/VCSharedMediaProtocol.h"
 
 static CFStringRef const VCPreferencesChangedNotification = CFSTR("com.murkaska.virtualcampro/preferences.changed");
 static CFStringRef const VCPreferencesDomain = CFSTR("com.murkaska.virtualcampro");
@@ -147,7 +149,7 @@ static NSString *VCPMediaServerVideoRuntimeDescription(uint64_t state) {
         case VCMediaServerVideoRuntimeUnsupportedPixelFormat:
             return [NSString stringWithFormat:@"相机像素格式暂不支持（%@）", ageText];
         case VCMediaServerVideoRuntimeConversionFailed:
-            return [NSString stringWithFormat:@"替换帧转换失败（%@）", ageText];
+            return [NSString stringWithFormat:@"替换帧转换失败：阶段 %@（%@）", @(detail), ageText];
         case VCMediaServerVideoRuntimeReplacementSucceeded:
             return [NSString stringWithFormat:@"最近一次系统替换成功（%@）", ageText];
         default:
@@ -1054,6 +1056,9 @@ static BOOL VCPRepairStoredPreferences(void) {
         url.fragment.length > 0) {
         return @"URL 格式无效";
     }
+    if (VCURLIsOBSPush(url)) {
+        return [NSString stringWithFormat:@"OBS 推流 · 监听 %@", url.port];
+    }
     BOOL hls = [url.absoluteString.lowercaseString containsString:@".m3u8"];
     NSString *host = url.port
         ? [NSString stringWithFormat:@"%@:%@", url.host, url.port] : url.host;
@@ -1319,7 +1324,7 @@ static BOOL VCPRepairStoredPreferences(void) {
     id sourceValue = CFBridgingRelease(
         CFPreferencesCopyAppValue(CFSTR("sourceType"), VCPreferencesDomain));
     NSString *title = @"网络流使用顺序";
-    NSString *message = @"1. 在 Windows 控制中心启动 OBS 桥接。\n2. 填写手机可访问的 HTTP/HTTPS URL。\n3. 点击“检测当前网络流”。\n4. 启用替换并重新打开相机应用。\n\n网络方向、帧率和质量全部由 OBS/发送端决定；手机保留原生麦克风。";
+    NSString *message = @"1. 手机 URL 填 http://0.0.0.0:8890/obs，启用摄像头替换。\n2. OBS 的自定义 FFmpeg 输出选择 URL、mpjpeg 格式和 mjpeg 视频编码，禁用音频编码器。\n3. OBS URL 填 http://手机IP:8890/obs，开始录制后打开相机。\n\nOBS 推流仅传输画面，麦克风保持原样。";
     switch (VCPReadIntegerPreference(sourceValue, 0, 2, 0)) {
         case 1:
             title = @"屏幕镜像使用顺序";
@@ -1746,7 +1751,7 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
     NSURL *streamURL = [NSURL URLWithString:trimmedValue];
     if (VCPReadIntegerPreference(sourceTypeValue, 0, 2, 0) != 0) {
         [self showStreamTestResultWithTitle:@"当前不是网络来源"
-                                   message:@"请将“替换来源”切换为网络 HLS / MJPEG 后再检测 URL。屏幕和本地媒体由 SpringBoard 本地读取，不建立网络连接。"];
+                                   message:@"请将“替换来源”切换为网络来源后再检测 URL。屏幕和本地媒体由 SpringBoard 本地读取。"];
         return;
     }
     NSString *scheme = streamURL.scheme.lowercaseString;
@@ -1759,6 +1764,13 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
         return;
     }
 
+    BOOL obsPush = VCURLIsOBSPush(streamURL);
+    if (obsPush && !VCPReadBooleanPreference(enabledValue, NO)) {
+        [self showStreamTestResultWithTitle:@"OBS 接收尚未开启"
+                                   message:@"启用摄像头替换后，手机会监听该端口，等待 OBS 推流。"];
+        return;
+    }
+
     if (VCPReadBooleanPreference(enabledValue, NO)) {
         uint64_t status = VCPStreamStatusDisabled;
         VCPGetSystemStreamStatus(&status);
@@ -1768,16 +1780,17 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
                                            message:@"SpringBoard 媒体服务正在接收有效网络帧；无需建立第二条测试连接。"];
                 return;
             case VCPStreamStatusConnecting:
-                [self showStreamTestResultWithTitle:@"正在连接"
-                                           message:@"SpringBoard 媒体服务正在连接当前 URL。请确认 Windows 桥接已启动，稍后再检测。"];
+                [self showStreamTestResultWithTitle:obsPush ? @"等待 OBS 推流" : @"正在连接"
+                                           message:obsPush ? @"手机正在等待 OBS 连接；请检查 OBS 输出 URL 和手机 IP。"
+                                                           : @"SpringBoard 媒体服务正在连接当前 URL。请确认 OBS 输出已启动，稍后再检测。"];
                 return;
             case VCPStreamStatusError:
                 [self showStreamTestResultWithTitle:@"连接需要恢复"
-                                           message:@"SpringBoard 媒体服务已检测到断流并正在自动重连。请检查 Windows 桥接、IP 与防火墙。"];
+                                           message:@"SpringBoard 媒体服务已检测到断流并正在自动重连。请检查 OBS 输出、IP 与防火墙。"];
                 return;
             case VCPStreamStatusHoldingLastFrame:
                 [self showStreamTestResultWithTitle:@"正在保持最后一帧"
-                                           message:@"网络连接正在恢复，系统相机仍输出最后收到的替换帧；请检查 Windows 桥接和网络稳定性。"];
+                                           message:@"网络连接正在恢复，系统相机仍输出最后收到的替换帧；请检查 OBS 输出和网络稳定性。"];
                 return;
             default:
                 [self showStreamTestResultWithTitle:@"媒体服务尚未接管"

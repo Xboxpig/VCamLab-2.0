@@ -1,5 +1,8 @@
 #import "AVAssetStreamAdapter.h"
 #import "VCJPEGParser.h"
+#import "VCMJPEGPushServer.h"
+#import "VCMJPEGPlayout.h"
+#import "VCOBSPushURL.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -24,6 +27,8 @@ static void *VCPlayerItemStatusContext = &VCPlayerItemStatusContext;
 static const NSUInteger VCMaximumJPEGFrameBytes = 24 * 1024 * 1024;
 static const NSUInteger VCMaximumMJPEGBufferBytes = 32 * 1024 * 1024;
 static const NSUInteger VCMJPEGBufferCompactionThresholdBytes = 1024 * 1024;
+static const NSUInteger VCMJPEGPlayoutMaximumBytes = 64 * 1024 * 1024;
+static const NSUInteger VCMJPEGPlayoutMaximumFrames = 180;
 // Three buffers are retained by the cross-process publication ring. Keep three
 // additional allocations for the decoder/current fan-out so a temporarily slow
 // photo or preview consumer does not force avoidable network-frame loss.
@@ -64,6 +69,16 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     return colorSpace;
 }
 
+@interface VCMJPEGBufferedFrame : NSObject
+@property (nonatomic, strong) NSData *data;
+@property (nonatomic, assign) size_t width;
+@property (nonatomic, assign) size_t height;
+@property (nonatomic, assign) CFTimeInterval arrivalTime;
+@end
+
+@implementation VCMJPEGBufferedFrame
+@end
+
 @interface AVAssetStreamAdapter () {
     CVPixelBufferPoolRef _mjpegPixelBufferPool;
     size_t _mjpegPoolWidth;
@@ -78,6 +93,13 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     NSUInteger _pendingMJPEGConnectionGeneration;
     NSUInteger _mjpegConnectionGeneration;
     BOOL _mjpegDecodeScheduled;
+    NSMutableArray<VCMJPEGBufferedFrame *> *_mjpegPlayoutFrames;
+    NSUInteger _mjpegPlayoutBytes;
+    VCMJPEGPlayoutState _mjpegPlayoutState;
+    BOOL _mjpegPlayoutScheduled;
+    NSUInteger _mjpegPlayoutTicket;
+    CFTimeInterval _mjpegPlayoutDeadline;
+    BOOL _mjpegPlayoutForceStart;
     VTDecompressionSessionRef _mjpegDecompressionSession;
     CMVideoFormatDescriptionRef _mjpegVideoFormatDescription;
     size_t _mjpegDecoderWidth;
@@ -108,6 +130,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 @property (atomic, strong) NSURLSessionDataTask *task;
 @property (atomic, strong) NSOperationQueue *delegateQueue;
 @property (atomic, strong) NSMutableData *imageData;
+@property (atomic, strong) VCMJPEGPushServer *pushServer;
 
 @property (atomic, strong) AVPlayer *hlsPlayer;
 @property (atomic, strong) AVPlayerItem *hlsPlayerItem;
@@ -133,6 +156,10 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 - (CVPixelBufferRef)copyPixelBufferFromJPEGDataUsingVideoToolbox:(NSData *)jpegData
                                                            width:(size_t)width
                                                           height:(size_t)height CF_RETURNS_RETAINED;
+- (CVPixelBufferRef)copyPixelBufferFromJPEGDataUsingVideoToolbox:(NSData *)jpegData
+                                                           width:(size_t)width
+                                                          height:(size_t)height
+                                            allowSessionRecovery:(BOOL)allowRecovery CF_RETURNS_RETAINED;
 - (CVPixelBufferRef)copyPixelBufferFromJPEGDataUsingImageIO:(NSData *)jpegData
                                                       width:(size_t)width
                                                      height:(size_t)height CF_RETURNS_RETAINED;
@@ -144,6 +171,12 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 - (void)compactMJPEGReceiveBufferLockedIfNeeded:(BOOL)force;
 - (void)reportMalformedMJPEGStream:(NSString *)description;
 - (void)decodePendingMJPEGFrames;
+- (void)resetMJPEGPlayoutLocked;
+- (void)scheduleMJPEGPlayoutLockedAfter:(CFTimeInterval)delay;
+- (void)drainMJPEGPlayoutForGeneration:(NSUInteger)generation ticket:(NSUInteger)ticket;
+- (void)consumeMJPEGData:(NSData *)data session:(NSURLSession *)session
+                dataTask:(NSURLSessionDataTask *)dataTask;
+- (void)pushConnectionChanged:(BOOL)connected;
 - (void)catchUpToHLSLiveEdgeIfNeeded;
 - (void)configureHLSFrameTimerForPlayerItem:(AVPlayerItem *)item;
 @end
@@ -155,6 +188,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     if (self) {
         _streamURL = url;
         _mjpegReceiveLock = (os_unfair_lock)OS_UNFAIR_LOCK_INIT;
+        _mjpegPlayoutFrames = [NSMutableArray array];
         dispatch_queue_attr_t hlsQueueAttributes =
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
                                                      QOS_CLASS_USER_INTERACTIVE,
@@ -164,7 +198,8 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
         _mjpegDecodeQueue = dispatch_queue_create(
             "com.murkaska.virtualcampro.mjpeg-decode", hlsQueueAttributes);
         NSString *absoluteString = url.absoluteString.lowercaseString;
-        _streamProtocol = [absoluteString containsString:@".m3u8"] ? VCStreamProtocolHLS : VCStreamProtocolMJPEG;
+        _streamProtocol = VCURLIsOBSPush(url) ? VCStreamProtocolOBSPush
+            : ([absoluteString containsString:@".m3u8"] ? VCStreamProtocolHLS : VCStreamProtocolMJPEG);
     }
     return self;
 }
@@ -214,11 +249,17 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
             if (!strongSelf) return;
             os_unfair_lock_lock(&strongSelf->_mjpegReceiveLock);
             [strongSelf resetMJPEGReceiveBufferLocked];
+            strongSelf->_mjpegConnectionGeneration++;
+            strongSelf->_pendingMJPEGData = nil;
+            [strongSelf resetMJPEGPlayoutLocked];
             os_unfair_lock_unlock(&strongSelf->_mjpegReceiveLock);
         }];
     } else {
         os_unfair_lock_lock(&_mjpegReceiveLock);
         [self resetMJPEGReceiveBufferLocked];
+        _mjpegConnectionGeneration++;
+        _pendingMJPEGData = nil;
+        [self resetMJPEGPlayoutLocked];
         os_unfair_lock_unlock(&_mjpegReceiveLock);
     }
     // Pool creation and JPEG rendering live exclusively on this queue. Keeping
@@ -319,6 +360,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 }
 
 - (void)verifyStreamHealth {
+    if (self.streamProtocol == VCStreamProtocolOBSPush && !self.pushServer.isConnected) return;
     if (self.streamProtocol == VCStreamProtocolHLS) {
         [self catchUpToHLSLiveEdgeIfNeeded];
     }
@@ -539,7 +581,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 #pragma mark - MJPEG
 
 - (void)startMJPEGStream {
-    if (!self.running || self.task) return;
+    if (!self.running || self.task || self.pushServer) return;
     @synchronized (self) {
         self.attemptStartTime = CFAbsoluteTimeGetCurrent();
         self.lastFrameTime = 0;
@@ -547,6 +589,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     os_unfair_lock_lock(&_mjpegReceiveLock);
     _lastMJPEGErrorReportTime = 0;
     _mjpegConnectionGeneration++;
+    [self resetMJPEGPlayoutLocked];
     _pendingMJPEGData = nil;
     _pendingMJPEGWidth = 0;
     _pendingMJPEGHeight = 0;
@@ -564,6 +607,25 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     self.imageData = [NSMutableData data];
     [self resetMJPEGReceiveBufferLocked];
     os_unfair_lock_unlock(&_mjpegReceiveLock);
+
+    if (self.streamProtocol == VCStreamProtocolOBSPush) {
+        VCMJPEGPushServer *server = [[VCMJPEGPushServer alloc]
+            initWithPort:(uint16_t)self.streamURL.port.unsignedIntegerValue path:self.streamURL.path];
+        __weak AVAssetStreamAdapter *weakSelf = self;
+        server.dataHandler = ^(NSData *data) {
+            [weakSelf consumeMJPEGData:data session:nil dataTask:nil];
+        };
+        server.connectionHandler = ^(BOOL connected) {
+            [weakSelf pushConnectionChanged:connected];
+        };
+        self.pushServer = server;
+        NSError *error = nil;
+        if (![server startWithError:&error]) {
+            self.pushServer = nil;
+            [self scheduleReconnectAfterError:error];
+        }
+        return;
+    }
 
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     configuration.timeoutIntervalForRequest = 20.0;
@@ -588,6 +650,9 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
 }
 
 - (void)stopMJPEGStream {
+    VCMJPEGPushServer *server = self.pushServer;
+    self.pushServer = nil;
+    [server stop];
     NSURLSessionDataTask *task = self.task;
     NSURLSession *session = self.session;
     self.task = nil;
@@ -595,6 +660,7 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     self.delegateQueue = nil;
     os_unfair_lock_lock(&_mjpegReceiveLock);
     _mjpegConnectionGeneration++;
+    [self resetMJPEGPlayoutLocked];
     _pendingMJPEGData = nil;
     _pendingMJPEGWidth = 0;
     _pendingMJPEGHeight = 0;
@@ -603,6 +669,29 @@ static CGColorSpaceRef VCSharedRGBColorSpace(void) {
     os_unfair_lock_unlock(&_mjpegReceiveLock);
     [task cancel];
     [session invalidateAndCancel];
+}
+
+- (void)pushConnectionChanged:(BOOL)connected {
+    BOOL hadFrames = NO;
+    @synchronized (self) {
+        if (!self.running || self.streamProtocol != VCStreamProtocolOBSPush) return;
+        hadFrames = self.lastFrameTime > 0;
+        self.connecting = YES;
+        self.attemptStartTime = CFAbsoluteTimeGetCurrent();
+        self.lastFrameTime = 0;
+    }
+    os_unfair_lock_lock(&_mjpegReceiveLock);
+    // Complete JPEGs already queued remain valid across a short reconnect.
+    // Drop only the incomplete parser input; the serial decode queue preserves
+    // the order of old and new complete frames. Source stop/restart still
+    // advances the generation and discards all outstanding work.
+    [self resetMJPEGReceiveBufferLocked];
+    os_unfair_lock_unlock(&_mjpegReceiveLock);
+    if (!connected && hadFrames) {
+        NSError *error = [NSError errorWithDomain:VCStreamErrorDomain code:1006
+            userInfo:@{NSLocalizedDescriptionKey: @"OBS push connection closed"}];
+        [self reportError:error];
+    }
 }
 
 - (void)URLSession:(NSURLSession *)session
@@ -707,7 +796,7 @@ didReceiveResponse:(NSURLResponse *)response
         [self releaseMJPEGDecompressionSession];
         _mjpegVTDisabledWidth = width;
         _mjpegVTDisabledHeight = height;
-        _mjpegVTDisabledUntil = CFAbsoluteTimeGetCurrent() + 30.0;
+        _mjpegVTDisabledUntil = CFAbsoluteTimeGetCurrent() + 1.0;
         return NO;
     }
     VTSessionSetProperty(_mjpegDecompressionSession,
@@ -809,12 +898,22 @@ didReceiveResponse:(NSURLResponse *)response
     // Hardware sessions can fail transiently during pressure or decoder
     // reconfiguration. Use ImageIO briefly, then probe VideoToolbox again
     // instead of pinning this resolution to CPU decode for the process life.
-    _mjpegVTDisabledUntil = CFAbsoluteTimeGetCurrent() + 30.0;
+    _mjpegVTDisabledUntil = CFAbsoluteTimeGetCurrent() + 1.0;
 }
 
 - (CVPixelBufferRef)copyPixelBufferFromJPEGDataUsingVideoToolbox:(NSData *)jpegData
                                                            width:(size_t)width
                                                           height:(size_t)height CF_RETURNS_RETAINED {
+    return [self copyPixelBufferFromJPEGDataUsingVideoToolbox:jpegData
+                                                       width:width
+                                                      height:height
+                                        allowSessionRecovery:YES];
+}
+
+- (CVPixelBufferRef)copyPixelBufferFromJPEGDataUsingVideoToolbox:(NSData *)jpegData
+                                                           width:(size_t)width
+                                                          height:(size_t)height
+                                            allowSessionRecovery:(BOOL)allowRecovery CF_RETURNS_RETAINED {
     if (![self prepareMJPEGDecompressionSessionForWidth:width height:height]) return NULL;
 
     CMBlockBufferRef blockBuffer = NULL;
@@ -875,6 +974,24 @@ didReceiveResponse:(NSURLResponse *)response
         return context.pixelBuffer;
     }
     if (context.pixelBuffer) CVPixelBufferRelease(context.pixelBuffer);
+    OSStatus failure = decodeStatus != noErr ? decodeStatus : context.status;
+    BOOL resetSession = failure == kVTInvalidSessionErr ||
+                        failure == kVTVideoDecoderMalfunctionErr ||
+                        failure == kVTVideoDecoderRemovedErr ||
+                        failure == kVTVideoDecoderNotAvailableNowErr;
+    if (resetSession) {
+        [self releaseMJPEGDecompressionSession];
+        if (allowRecovery) {
+            return [self copyPixelBufferFromJPEGDataUsingVideoToolbox:jpegData
+                                                               width:width
+                                                              height:height
+                                                allowSessionRecovery:NO];
+        }
+        _mjpegVTDisabledWidth = width;
+        _mjpegVTDisabledHeight = height;
+        _mjpegVTDisabledUntil = CFAbsoluteTimeGetCurrent() + 1.0;
+        return NULL;
+    }
     [self recordMJPEGVideoToolboxFailureForWidth:width height:height];
     return NULL;
 }
@@ -1061,9 +1178,81 @@ didReceiveResponse:(NSURLResponse *)response
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
-    if (session != self.session || dataTask != self.task || !self.running || data.length == 0) return;
+    [self consumeMJPEGData:data session:session dataTask:dataTask];
+}
+
+- (void)resetMJPEGPlayoutLocked {
+    [_mjpegPlayoutFrames removeAllObjects];
+    _mjpegPlayoutBytes = 0;
+    _mjpegPlayoutScheduled = NO;
+    _mjpegPlayoutTicket++;
+    _mjpegPlayoutDeadline = 0;
+    _mjpegPlayoutForceStart = NO;
+    VCMJPEGPlayoutReset(&_mjpegPlayoutState);
+}
+
+- (void)scheduleMJPEGPlayoutLockedAfter:(CFTimeInterval)delay {
+    if (_mjpegPlayoutFrames.count == 0) return;
+    delay = MAX(0.0, MIN(delay, 1.0));
+    CFTimeInterval deadline = CACurrentMediaTime() + delay;
+    if (_mjpegPlayoutScheduled &&
+        !(!_mjpegPlayoutState.primed && _mjpegPlayoutForceStart &&
+          deadline < _mjpegPlayoutDeadline - 0.001)) return;
+    _mjpegPlayoutScheduled = YES;
+    _mjpegPlayoutDeadline = deadline;
+    NSUInteger ticket = ++_mjpegPlayoutTicket;
+    NSUInteger generation = _mjpegConnectionGeneration;
+    __weak AVAssetStreamAdapter *weakSelf = self;
+    int64_t nanoseconds = (int64_t)(delay * NSEC_PER_SEC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanoseconds),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [weakSelf drainMJPEGPlayoutForGeneration:generation ticket:ticket];
+    });
+}
+
+- (void)drainMJPEGPlayoutForGeneration:(NSUInteger)generation ticket:(NSUInteger)ticket {
     os_unfair_lock_lock(&_mjpegReceiveLock);
-    if (session != self.session || dataTask != self.task || !self.running) {
+    if (generation != _mjpegConnectionGeneration || ticket != _mjpegPlayoutTicket) {
+        os_unfair_lock_unlock(&_mjpegReceiveLock);
+        return;
+    }
+    _mjpegPlayoutScheduled = NO;
+    _mjpegPlayoutDeadline = 0;
+    VCMJPEGBufferedFrame *first = _mjpegPlayoutFrames.firstObject;
+    VCMJPEGBufferedFrame *last = _mjpegPlayoutFrames.lastObject;
+    CFTimeInterval now = CACurrentMediaTime();
+    double wait = 0;
+    VCMJPEGPlayoutDecision decision = VCMJPEGPlayoutNext(
+        &_mjpegPlayoutState, now, first.arrivalTime, last.arrivalTime,
+        _mjpegPlayoutFrames.count, _mjpegPlayoutForceStart, &wait);
+    if (decision == VCMJPEGPlayoutWait) {
+        [self scheduleMJPEGPlayoutLockedAfter:wait];
+    } else if (decision == VCMJPEGPlayoutEmit && self.running) {
+        [_mjpegPlayoutFrames removeObjectAtIndex:0];
+        _mjpegPlayoutBytes -= MIN(_mjpegPlayoutBytes, first.data.length);
+        _mjpegPlayoutForceStart = NO;
+        if (_pendingMJPEGData) _mjpegSupersededFrameCount++;
+        _pendingMJPEGData = first.data;
+        _pendingMJPEGWidth = first.width;
+        _pendingMJPEGHeight = first.height;
+        _pendingMJPEGConnectionGeneration = generation;
+        if (!_mjpegDecodeScheduled) {
+            _mjpegDecodeScheduled = YES;
+            dispatch_async(self.mjpegDecodeQueue, ^{ [self decodePendingMJPEGFrames]; });
+        }
+        if (_mjpegPlayoutFrames.count) {
+            [self scheduleMJPEGPlayoutLockedAfter:MAX(0.0, _mjpegPlayoutState.next_time - now)];
+        }
+    }
+    os_unfair_lock_unlock(&_mjpegReceiveLock);
+}
+
+- (void)consumeMJPEGData:(NSData *)data session:(NSURLSession *)session
+                dataTask:(NSURLSessionDataTask *)dataTask {
+    if (!self.running || data.length == 0) return;
+    os_unfair_lock_lock(&_mjpegReceiveLock);
+    if (!self.running || (session && (session != self.session || dataTask != self.task)) ||
+        (!session && (self.streamProtocol != VCStreamProtocolOBSPush || !self.pushServer))) {
         os_unfair_lock_unlock(&_mjpegReceiveLock);
         return;
     }
@@ -1149,24 +1338,46 @@ didReceiveResponse:(NSURLResponse *)response
         }
         NSUInteger imageLength = (NSUInteger)parsedImageLength;
 
-        // A network callback can contain several complete frames after Wi-Fi
-        // jitter or temporary decoder pressure. Keep only the newest complete
-        // JPEG in this callback so recovery catches up instead of displaying a
-        // stale backlog frame-by-frame.
-        if (latestJPEGData) _mjpegSupersededFrameCount++;
-        latestJPEGData = [imageData subdataWithRange:NSMakeRange(_mjpegBufferOffset,
-                                                                 imageLength)];
-        latestJPEGWidth = _mjpegParserState.sawFrameDimensions
-            ? _mjpegParserState.width : 0;
-        latestJPEGHeight = _mjpegParserState.sawFrameDimensions
-            ? _mjpegParserState.height : 0;
+        NSData *frameData = [imageData subdataWithRange:NSMakeRange(_mjpegBufferOffset,
+                                                                    imageLength)];
+        size_t frameWidth = _mjpegParserState.sawFrameDimensions ? _mjpegParserState.width : 0;
+        size_t frameHeight = _mjpegParserState.sawFrameDimensions ? _mjpegParserState.height : 0;
+        if (self.streamProtocol == VCStreamProtocolOBSPush) {
+            while (_mjpegPlayoutFrames.count &&
+                   (_mjpegPlayoutFrames.count >= VCMJPEGPlayoutMaximumFrames ||
+                    _mjpegPlayoutBytes > VCMJPEGPlayoutMaximumBytes - frameData.length ||
+                    CACurrentMediaTime() - _mjpegPlayoutFrames.firstObject.arrivalTime > 2.0)) {
+                VCMJPEGBufferedFrame *retired = _mjpegPlayoutFrames.firstObject;
+                _mjpegPlayoutBytes -= MIN(_mjpegPlayoutBytes, retired.data.length);
+                [_mjpegPlayoutFrames removeObjectAtIndex:0];
+                _mjpegSupersededFrameCount++;
+                _mjpegPlayoutForceStart = YES;
+            }
+            VCMJPEGBufferedFrame *buffered = [VCMJPEGBufferedFrame new];
+            buffered.data = frameData;
+            buffered.width = frameWidth;
+            buffered.height = frameHeight;
+            buffered.arrivalTime = CACurrentMediaTime();
+            VCMJPEGPlayoutObserve(&_mjpegPlayoutState, buffered.arrivalTime);
+            [_mjpegPlayoutFrames addObject:buffered];
+            _mjpegPlayoutBytes += frameData.length;
+        } else {
+            // Pull streams keep the latest complete frame when a callback
+            // contains several images.
+            if (latestJPEGData) _mjpegSupersededFrameCount++;
+            latestJPEGData = frameData;
+            latestJPEGWidth = frameWidth;
+            latestJPEGHeight = frameHeight;
+        }
         _mjpegParsedFrameCount++;
         _mjpegBufferOffset += imageLength;
         VCJPEGParserReset(&_mjpegParserState);
         [self compactMJPEGReceiveBufferLockedIfNeeded:NO];
     }
 
-    if (latestJPEGData) {
+    if (self.streamProtocol == VCStreamProtocolOBSPush) {
+        [self scheduleMJPEGPlayoutLockedAfter:0];
+    } else if (latestJPEGData) {
         if (_pendingMJPEGData) _mjpegSupersededFrameCount++;
         _pendingMJPEGData = latestJPEGData;
         _pendingMJPEGWidth = latestJPEGWidth;

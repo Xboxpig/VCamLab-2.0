@@ -4,6 +4,7 @@
 #import <ImageIO/ImageIO.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <dlfcn.h>
 #import <float.h>
 #import <mach/mach_time.h>
 #import <os/lock.h>
@@ -15,8 +16,25 @@
 // running for another BW output node.
 static os_unfair_lock VCFrameStateLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock VCPixelTransferSessionLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock VCFrontRotationLock = OS_UNFAIR_LOCK_INIT;
+static CVPixelBufferRef VCFrontRotationSource = NULL;
+static CVPixelBufferRef VCFrontRotationOutput = NULL;
+static CFTypeRef VCFrontRotationSession = NULL;
+typedef OSStatus (*VCRotationCreateFunction)(CFAllocatorRef, CFTypeRef *);
+typedef OSStatus (*VCRotationImageFunction)(CFTypeRef, CVPixelBufferRef, CVPixelBufferRef);
+typedef void (*VCRotationInvalidateFunction)(CFTypeRef);
+static VCRotationCreateFunction VCRotationCreate = NULL;
+static VCRotationImageFunction VCRotationImage = NULL;
+static VCRotationInvalidateFunction VCRotationInvalidate = NULL;
+static CFStringRef VCRotationKey = NULL;
+static CFStringRef VCRotation180 = NULL;
 static VTPixelTransferSessionRef VCTransferSession = NULL;
 static CIContext *VCOrientationContext = nil;
+static _Thread_local VCFrameConversionFailure VCFrameFailure = VCFrameConversionFailureNone;
+
+VCFrameConversionFailure VCFrameConversionLastFailure(void) {
+    return VCFrameFailure;
+}
 
 static double VCMillisecondsBetweenMachTicks(uint64_t start, uint64_t end) {
     if (end < start) return 0.0;
@@ -69,6 +87,9 @@ static CGColorSpaceRef VCSharedDeviceRGBColorSpace(void) {
 enum {
     VCMaximumCachedFormats = 12,
     VCMaximumOutstandingBuffersPerFormat = 6,
+    VCMaximumCameraBuffersPerFormat = 64,
+    VCMaximumCameraPoolBytes = 320 * 1024 * 1024,
+    VCMaximumActiveCameraPoolsBytes = 384 * 1024 * 1024,
     VCMaximumConvertedFrameCacheBytes = 64 * 1024 * 1024,
 };
 
@@ -78,6 +99,7 @@ typedef struct {
     OSType pixelFormat;
     CVPixelBufferPoolRef pool;
     uint64_t lastUse;
+    uint64_t lastCameraUseTicks;
 } VCPixelBufferPoolEntry;
 
 typedef struct {
@@ -113,6 +135,42 @@ static CFDictionaryRef VCBoundedPixelBufferAllocationAttributes(void) {
     return (__bridge CFDictionaryRef)attributes;
 }
 
+// Called under VCFrameStateLock. Share the elevated budget between recently
+// active camera formats, and flush idle pools when changing formats. Buffers
+// still retained by camera consumers are released by those consumers later.
+static CFDictionaryRef VCCameraPixelBufferAllocationAttributes(CVPixelBufferRef templateBuffer,
+                                                              CVPixelBufferPoolRef pool) {
+    static NSDictionary *attributes[VCMaximumCameraBuffersPerFormat + 1];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSUInteger count = 1; count <= VCMaximumCameraBuffersPerFormat; count++) {
+            attributes[count] = @{ (id)kCVPixelBufferPoolAllocationThresholdKey: @(count) };
+        }
+    });
+    size_t bytes = templateBuffer ? CVPixelBufferGetDataSize(templateBuffer) : 0;
+    IOSurfaceRef surface = templateBuffer ? CVPixelBufferGetIOSurface(templateBuffer) : NULL;
+    if (surface) bytes = MAX(bytes, IOSurfaceGetAllocSize(surface));
+    uint64_t now = mach_continuous_time();
+    size_t activePools = 0;
+    for (size_t index = 0; index < VCPixelBufferPoolEntryCount; index++) {
+        VCPixelBufferPoolEntry *entry = &VCPixelBufferPoolEntries[index];
+        if (entry->pool == pool) entry->lastCameraUseTicks = now;
+        if (!entry->lastCameraUseTicks) continue;
+        if (VCMillisecondsBetweenMachTicks(entry->lastCameraUseTicks, now) <= 2000.0) {
+            activePools++;
+        } else {
+            CVPixelBufferPoolFlush(entry->pool, kCVPixelBufferPoolFlushExcessBuffers);
+            entry->lastCameraUseTicks = 0;
+        }
+    }
+    size_t budget = MIN((size_t)VCMaximumCameraPoolBytes,
+                        (size_t)VCMaximumActiveCameraPoolsBytes / MAX(activePools, (size_t)1));
+    size_t count = bytes ? budget / bytes : 16;
+    count = MAX((size_t)VCMaximumOutstandingBuffersPerFormat,
+                MIN((size_t)VCMaximumCameraBuffersPerFormat, count));
+    return (__bridge CFDictionaryRef)attributes[count];
+}
+
 static CVPixelBufferRef VCCopyPixelBufferMatchingTemplateAndDescription(
     CVPixelBufferRef source,
     CVPixelBufferRef templateBuffer,
@@ -126,6 +184,14 @@ BOOL VCIsSupportedReplacementPixelFormat(OSType pixelFormat) {
         case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
         case kCVPixelFormatType_420YpCbCr8Planar:
         case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+        case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+        case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarFullRange:
+        case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+        case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarVideoRange:
+        case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarFullRange:
+        case kCVPixelFormatType_Lossy_420YpCbCr10PackedBiPlanarVideoRange:
         case kCVPixelFormatType_422YpCbCr8:
         case kCVPixelFormatType_422YpCbCr8_yuvs:
         case kCVPixelFormatType_32BGRA:
@@ -273,10 +339,56 @@ static void VCLockedRemoveConvertedFrameAtIndex(size_t index) {
     VCConvertedFrameEntryCount--;
 }
 
+static BOOL VCLockedEvictOldestFrameForPool(size_t width, size_t height, OSType pixelFormat) {
+    size_t oldestIndex = NSNotFound;
+    size_t matches = 0;
+    for (size_t index = 0; index < VCConvertedFrameEntryCount; index++) {
+        VCConvertedFrameEntry *entry = &VCConvertedFrameEntries[index];
+        if (entry->width != width || entry->height != height || entry->pixelFormat != pixelFormat) continue;
+        matches++;
+        if (oldestIndex == NSNotFound || entry->lastUse < VCConvertedFrameEntries[oldestIndex].lastUse) {
+            oldestIndex = index;
+        }
+    }
+    // Preserve one recent result for a camera graph that is temporarily
+    // holding every pool buffer, while releasing older cache-owned buffers.
+    if (matches <= 1 || oldestIndex == NSNotFound) return NO;
+    VCLockedRemoveConvertedFrameAtIndex(oldestIndex);
+    return YES;
+}
+
+static BOOL VCLockedEvictOldestFrameHoldingOrientationBuffer(size_t width, size_t height,
+                                                             OSType pixelFormat) {
+    size_t oldestIndex = NSNotFound;
+    size_t matches = 0;
+    for (size_t index = 0; index < VCConvertedFrameEntryCount; index++) {
+        VCConvertedFrameEntry *entry = &VCConvertedFrameEntries[index];
+        CVPixelBufferRef source = entry->sourceBuffer;
+        BOOL sourceMatches = source && CVPixelBufferGetWidth(source) == width &&
+            CVPixelBufferGetHeight(source) == height &&
+            CVPixelBufferGetPixelFormatType(source) == pixelFormat;
+        BOOL outputMatches = entry->width == width && entry->height == height &&
+            entry->pixelFormat == pixelFormat;
+        if (!sourceMatches && !outputMatches) continue;
+        matches++;
+        if (oldestIndex == NSNotFound || entry->lastUse < VCConvertedFrameEntries[oldestIndex].lastUse) {
+            oldestIndex = index;
+        }
+    }
+    if (matches <= 1 || oldestIndex == NSNotFound) return NO;
+    VCLockedRemoveConvertedFrameAtIndex(oldestIndex);
+    return YES;
+}
+
 static size_t VCConvertedFrameByteCost(CVPixelBufferRef buffer) {
     if (!buffer) return 0;
     size_t byteCost = CVPixelBufferGetDataSize(buffer);
     if (byteCost > 0) return byteCost;
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(buffer);
+    if (surface) {
+        byteCost = IOSurfaceGetAllocSize(surface);
+        if (byteCost > 0) return byteCost;
+    }
     size_t planeCount = CVPixelBufferGetPlaneCount(buffer);
     if (planeCount == 0) {
         size_t rowBytes = CVPixelBufferGetBytesPerRow(buffer);
@@ -474,6 +586,12 @@ CVPixelBufferRef VCCopyPixelBufferApplyingOrientation(CVPixelBufferRef source,
             VCBoundedPixelBufferAllocationAttributes(),
             &destination)
         : kCVReturnInvalidArgument;
+    while (result == kCVReturnWouldExceedAllocationThreshold &&
+           VCLockedEvictOldestFrameHoldingOrientationBuffer(width, height,
+                                                             kCVPixelFormatType_32BGRA)) {
+        result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault, pool, VCBoundedPixelBufferAllocationAttributes(), &destination);
+    }
     os_unfair_lock_unlock(&VCFrameStateLock);
     if (result != kCVReturnSuccess || !destination) return NULL;
 
@@ -488,6 +606,91 @@ CVPixelBufferRef VCCopyPixelBufferApplyingOrientation(CVPixelBufferRef source,
                bounds:CGRectMake(0, 0, width, height)
            colorSpace:colorSpace];
     return destination;
+}
+
+static void VCReleaseFrontRotationSource(CVPixelBufferRef source) {
+    if (!source) return;
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(source);
+    if (surface) IOSurfaceDecrementUseCount(surface);
+    CVPixelBufferRelease(source);
+}
+
+static CVPixelBufferRef VCCopyFrontRotatedVideoToolboxBuffer(CVPixelBufferRef source) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        VCRotationCreate = (VCRotationCreateFunction)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionCreate");
+        VCRotationImage = (VCRotationImageFunction)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionRotateImage");
+        VCRotationInvalidate = (VCRotationInvalidateFunction)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionInvalidate");
+        const CFStringRef *key = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_Rotation");
+        const CFStringRef *value = dlsym(RTLD_DEFAULT, "kVTRotation_180");
+        VCRotationKey = key ? *key : NULL;
+        VCRotation180 = value ? *value : NULL;
+    });
+    if (!VCRotationCreate || !VCRotationImage || !VCRotationKey || !VCRotation180) return NULL;
+    if (!VCFrontRotationSession) {
+        OSStatus createStatus = VCRotationCreate(kCFAllocatorDefault, &VCFrontRotationSession);
+        if (createStatus != noErr || !VCFrontRotationSession) {
+            if (VCFrontRotationSession) CFRelease(VCFrontRotationSession);
+            VCFrontRotationSession = NULL;
+            return NULL;
+        }
+        if (VTSessionSetProperty((VTSessionRef)VCFrontRotationSession, VCRotationKey, VCRotation180) != noErr) {
+            if (VCRotationInvalidate) VCRotationInvalidate(VCFrontRotationSession);
+            CFRelease(VCFrontRotationSession);
+            VCFrontRotationSession = NULL;
+            return NULL;
+        }
+    }
+
+    size_t width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source);
+    OSType pixelFormat = CVPixelBufferGetPixelFormatType(source);
+    CVPixelBufferRef destination = NULL;
+    os_unfair_lock_lock(&VCFrameStateLock);
+    CVPixelBufferPoolRef pool = VCLockedPixelBufferPool(width, height, pixelFormat);
+    CVReturn result = pool ? CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+        kCFAllocatorDefault, pool, VCBoundedPixelBufferAllocationAttributes(), &destination)
+        : kCVReturnInvalidArgument;
+    while (result == kCVReturnWouldExceedAllocationThreshold &&
+           VCLockedEvictOldestFrameHoldingOrientationBuffer(width, height, pixelFormat)) {
+        result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault, pool, VCBoundedPixelBufferAllocationAttributes(), &destination);
+    }
+    os_unfair_lock_unlock(&VCFrameStateLock);
+    if (result != kCVReturnSuccess || !destination) return NULL;
+    if (VCRotationImage(VCFrontRotationSession, source, destination) != noErr) {
+        CVPixelBufferRelease(destination);
+        return NULL;
+    }
+    return destination;
+}
+
+CVPixelBufferRef VCCopyFrontCameraPixelBuffer(CVPixelBufferRef source) {
+    if (!source) return NULL;
+    os_unfair_lock_lock(&VCFrontRotationLock);
+    if (VCFrontRotationSource == source && VCFrontRotationOutput) {
+        CVPixelBufferRef cached = CVPixelBufferRetain(VCFrontRotationOutput);
+        os_unfair_lock_unlock(&VCFrontRotationLock);
+        return cached;
+    }
+    CVPixelBufferRef rotated = VCCopyFrontRotatedVideoToolboxBuffer(source);
+    if (!rotated) rotated = VCCopyPixelBufferApplyingOrientation(source, 180, NO);
+    if (rotated) {
+        CVPixelBufferRef oldSource = VCFrontRotationSource;
+        CVPixelBufferRef oldOutput = VCFrontRotationOutput;
+        IOSurfaceRef surface = CVPixelBufferGetIOSurface(source);
+        if (surface) IOSurfaceIncrementUseCount(surface);
+        VCFrontRotationSource = CVPixelBufferRetain(source);
+        VCFrontRotationOutput = CVPixelBufferRetain(rotated);
+        VCReleaseFrontRotationSource(oldSource);
+        if (oldOutput) CVPixelBufferRelease(oldOutput);
+    } else if (VCFrontRotationOutput &&
+               CVPixelBufferGetWidth(VCFrontRotationOutput) == CVPixelBufferGetWidth(source) &&
+               CVPixelBufferGetHeight(VCFrontRotationOutput) == CVPixelBufferGetHeight(source)) {
+        // Keep the last correctly oriented frame during temporary pool pressure.
+        rotated = CVPixelBufferRetain(VCFrontRotationOutput);
+    }
+    os_unfair_lock_unlock(&VCFrontRotationLock);
+    return rotated;
 }
 
 CVPixelBufferRef VCCopyDisplayPixelBuffer(CVPixelBufferRef source) {
@@ -535,6 +738,17 @@ void VCResetFrameConverterCache(void) {
 }
 
 void VCFlushFrameConverterCaches(BOOL releasePoolsAndSession) {
+    os_unfair_lock_lock(&VCFrontRotationLock);
+    VCReleaseFrontRotationSource(VCFrontRotationSource);
+    if (VCFrontRotationOutput) CVPixelBufferRelease(VCFrontRotationOutput);
+    VCFrontRotationSource = NULL;
+    VCFrontRotationOutput = NULL;
+    if (releasePoolsAndSession && VCFrontRotationSession) {
+        if (VCRotationInvalidate) VCRotationInvalidate(VCFrontRotationSession);
+        CFRelease(VCFrontRotationSession);
+        VCFrontRotationSession = NULL;
+    }
+    os_unfair_lock_unlock(&VCFrontRotationLock);
     // Conversion releases the state lock before waiting for the session lock,
     // so this ordering cannot deadlock with an in-flight transfer.
     os_unfair_lock_lock(&VCPixelTransferSessionLock);
@@ -583,13 +797,17 @@ static CVPixelBufferRef VCCopyPixelBufferMatchingTemplateAndDescription(
     BOOL aspectFill,
     CMFormatDescriptionRef templateDescription,
     CMVideoFormatDescriptionRef *replacementDescriptionOut) {
-    if (!source || !templateBuffer) return NULL;
+    if (!source || !templateBuffer) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
+        return NULL;
+    }
     if (replacementDescriptionOut) *replacementDescriptionOut = NULL;
 
     size_t width = CVPixelBufferGetWidth(templateBuffer);
     size_t height = CVPixelBufferGetHeight(templateBuffer);
     OSType pixelFormat = CVPixelBufferGetPixelFormatType(templateBuffer);
     if (width == 0 || height == 0 || !VCIsSupportedReplacementPixelFormat(pixelFormat)) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
         return NULL;
     }
 
@@ -610,14 +828,31 @@ static CVPixelBufferRef VCCopyPixelBufferMatchingTemplateAndDescription(
     }
 
     CVPixelBufferPoolRef pool = VCLockedPixelBufferPool(width, height, pixelFormat);
+    CFDictionaryRef allocationAttributes = VCCameraPixelBufferAllocationAttributes(templateBuffer, pool);
     CVReturn result = pool ? CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
                                 kCFAllocatorDefault,
                                 pool,
-                                VCBoundedPixelBufferAllocationAttributes(),
+                                allocationAttributes,
                                 &destination)
                            : kCVReturnInvalidArgument;
+    while (result == kCVReturnWouldExceedAllocationThreshold &&
+           VCLockedEvictOldestFrameForPool(width, height, pixelFormat)) {
+        result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+            kCFAllocatorDefault, pool, allocationAttributes, &destination);
+    }
+    if (result == kCVReturnWouldExceedAllocationThreshold) {
+        destination = VCLockedCopyMostRecentConvertedFrame(width, height, pixelFormat,
+                                                            aspectFill, templateDescription,
+                                                            replacementDescriptionOut);
+        if (destination) {
+            os_unfair_lock_unlock(&VCFrameStateLock);
+            return destination;
+        }
+    }
     os_unfair_lock_unlock(&VCFrameStateLock);
     if (result != kCVReturnSuccess || !destination) {
+        VCFrameFailure = result == kCVReturnWouldExceedAllocationThreshold
+            ? VCFrameConversionFailurePoolLimit : VCFrameConversionFailurePoolAllocation;
         return NULL;
     }
 
@@ -682,6 +917,7 @@ static CVPixelBufferRef VCCopyPixelBufferMatchingTemplateAndDescription(
     }
     uint64_t transferFinished = mach_continuous_time();
     if (status != noErr) {
+        VCFrameFailure = VCFrameConversionFailureTransfer;
         os_unfair_lock_unlock(&VCPixelTransferSessionLock);
         VCLogSlowPixelTransfer(conversionStarted,
                                sessionAcquired,
@@ -706,6 +942,7 @@ static CVPixelBufferRef VCCopyPixelBufferMatchingTemplateAndDescription(
                                                                    &replacementDescription);
         }
         if (status != noErr || !replacementDescription) {
+            VCFrameFailure = VCFrameConversionFailureFormatDescription;
             if (replacementDescription) CFRelease(replacementDescription);
             os_unfair_lock_unlock(&VCPixelTransferSessionLock);
             CVPixelBufferRelease(destination);
@@ -743,15 +980,23 @@ CMSampleBufferRef VCCopyReplacementSampleBuffer(CMSampleBufferRef original,
                                                  CVPixelBufferRef source,
                                                  BOOL aspectFill,
                                                  NSInteger preferredFPS) {
-    if (!original || !source) return NULL;
+    VCFrameFailure = VCFrameConversionFailureNone;
+    if (!original || !source) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
+        return NULL;
+    }
 
     CMFormatDescriptionRef originalDescription = CMSampleBufferGetFormatDescription(original);
     if (!originalDescription || CMFormatDescriptionGetMediaType(originalDescription) != kCMMediaType_Video) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
         return NULL;
     }
 
     CVPixelBufferRef templateBuffer = CMSampleBufferGetImageBuffer(original);
-    if (!templateBuffer) return NULL;
+    if (!templateBuffer) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
+        return NULL;
+    }
     OSType templatePixelFormat = CVPixelBufferGetPixelFormatType(templateBuffer);
     CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(
         (CMVideoFormatDescriptionRef)originalDescription);
@@ -760,6 +1005,7 @@ CMSampleBufferRef VCCopyReplacementSampleBuffer(CMSampleBufferRef original,
         dimensions.width <= 0 || dimensions.height <= 0 ||
         (size_t)dimensions.width != CVPixelBufferGetWidth(templateBuffer) ||
         (size_t)dimensions.height != CVPixelBufferGetHeight(templateBuffer)) {
+        VCFrameFailure = VCFrameConversionFailureTemplate;
         return NULL;
     }
 
@@ -772,6 +1018,7 @@ CMSampleBufferRef VCCopyReplacementSampleBuffer(CMSampleBufferRef original,
         &replacementDescription);
     if (!replacementBuffer) return NULL;
     if (!replacementDescription) {
+        VCFrameFailure = VCFrameConversionFailureFormatDescription;
         CVPixelBufferRelease(replacementBuffer);
         return NULL;
     }
@@ -797,7 +1044,10 @@ CMSampleBufferRef VCCopyReplacementSampleBuffer(CMSampleBufferRef original,
                                                                 &replacement);
     CFRelease(replacementDescription);
     CVPixelBufferRelease(replacementBuffer);
-    if (status != noErr || !replacement) return NULL;
+    if (status != noErr || !replacement) {
+        VCFrameFailure = VCFrameConversionFailureSampleBuffer;
+        return NULL;
+    }
 
     CFDictionaryRef attachments = CMCopyDictionaryOfAttachments(kCFAllocatorDefault,
                                                                  original,

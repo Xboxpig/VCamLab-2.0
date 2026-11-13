@@ -1,4 +1,4 @@
-#include "../VCJPEGParser.h"
+#include "../src/VCJPEGParser.h"
 
 #include <assert.h>
 #include <stdio.h>

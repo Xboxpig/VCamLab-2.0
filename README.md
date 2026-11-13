@@ -1,13 +1,17 @@
 # VirtualCamPro
 
-[![Build rootless package](https://github.com/GUSHU101/VCamLab-2.0/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/GUSHU101/VCamLab-2.0/actions/workflows/build.yml)
-[![Source validation](https://github.com/GUSHU101/VCamLab-2.0/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/GUSHU101/VCamLab-2.0/actions/workflows/test.yml)
+[![Build rootless package](https://github.com/Xboxpig/VCamLab-2.0/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Xboxpig/VCamLab-2.0/actions/workflows/build.yml)
+[![Source validation](https://github.com/Xboxpig/VCamLab-2.0/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Xboxpig/VCamLab-2.0/actions/workflows/test.yml)
 
-VirtualCamPro 是面向 **rootless 越狱 iOS 15** 的系统级虚拟摄像头/麦克风插件。SpringBoard 进程只生成一份媒体流，`mediaserverd` 在 `CMCapture` 相机媒体图的 `BWNodeOutput` 处替换真实 `CMSampleBuffer`；照片、录像、视频通话、WebRTC 与扫码等下游因此读取同一份替换样本，而不是在界面上覆盖一层图片。
+VirtualCamPro 是面向 **rootless 越狱 iOS 15 / 16** 的系统级虚拟摄像头/麦克风插件。SpringBoard 进程只生成一份媒体流，`mediaserverd` 在 `CMCapture` 相机媒体图的 `BWNodeOutput` 处替换真实 `CMSampleBuffer`。iPhone 12、iOS 16.6 上已验证 OBS 网络画面的系统相机预览和录像；私有相机接口在其他设备、系统版本和应用中的兼容性仍需分别验证。
 
-当前版本：`2.24.2`
+当前版本：`2.24.3`
 
-> 正式 `.deb` 由 GitHub Actions 从当前提交构建并作为 `VirtualCamPro-rootless` artifact 发布；不要混用历史 2.8.0 二进制。
+## 上游来源
+
+本仓库 fork 自 [GUSHU101/VCamLab-2.0](https://github.com/GUSHU101/VCamLab-2.0)，保留上游 Git 历史；本次修改基于上游提交 [`d0c1106`](https://github.com/GUSHU101/VCamLab-2.0/commit/d0c11066176fa1dea6b5f148d5290e6425aff905)。这里增加了 iOS 16.6 适配、OBS 直接推流和录像缓冲，并整理了源码目录。
+
+> GitHub Actions 可从当前提交构建 `VirtualCamPro-rootless` artifact。iOS 16.6 实机验证使用设备上的 Procursus 构建，具体命令和结果见 [验证记录](IOS16-TEST-STATUS.md)。
 
 ## 功能
 
@@ -21,7 +25,7 @@ VirtualCamPro 是面向 **rootless 越狱 iOS 15** 的系统级虚拟摄像头/�
 - 屏幕镜像：SpringBoard 通过 CoreAnimation 直接渲染到 IOSurface，再交给系统相机管线。
 - HLS：URL 中包含 `.m3u8` 时使用 `AVPlayerItemVideoOutput` 解码；轮询频率按发送端 nominal FPS 自适应，不再让 30/60 FPS 流固定消耗 240 Hz 主线程轮询。
 - MJPEG：其他 HTTP/HTTPS URL 按连续 JPEG 流解析；增量校验 JPEG 段结构、直接读取 SOF 尺寸并限制单帧与接收缓冲。优先尝试实时 VideoToolbox→IOSurface NV12 解码，不支持时自动回退 ImageIO。
-- 网络流参数透传：手机不旋转、镜像、限帧、缩略或重编码网络帧，分辨率、方向、帧率和质量由 Windows/OBS 发送端决定；网络模式不发布替换音频，始终使用手机原生麦克风。
+- 网络流参数：分辨率、画面比例、帧率和质量由 Windows/OBS 发送端决定；iOS 16 的直接 OBS 推流对系统相机前摄做方向校正。网络模式不发布替换音频，始终使用手机原生麦克风。
 - 无日志运行诊断：设置页用低频进程心跳排除历史 notify 假状态，并直接显示 SpringBoard 共享视频总线、mediaserverd Hook/取帧/转换/替换以及真实 AVFoundation 代理/预览/照片回退活动；共享读取失败会细分到控制面、直连状态、帧 IOSurface 查找、包装和发布竞争，切回设置后仍可复制最后阶段和发生时间。
 - 运行状态与恢复：设置页直接显示 SpringBoard 来源产帧状态、mediaserverd 系统视频接管状态和应用回退状态，并可在不改变任何来源参数的情况下原子重载当前生产者。
 - 来源故障隔离：屏幕、本地文件和网络来源的错误/完成回调都绑定当前 generation；切换后迟到的旧回调不能覆盖新来源状态。非循环本地媒体自然结束时会立即清空共享 PCM、恢复原生麦克风，并在控制面板显示“播放完成”。
@@ -32,7 +36,7 @@ VirtualCamPro 是面向 **rootless 越狱 iOS 15** 的系统级虚拟摄像头/�
 - 节点与格式隔离：仅处理声明为视频的颜色像素输出；只有本地媒体发布的 PCM 才替换麦克风，网络/屏幕音频、深度、视差和压缩样本原样透传。
 - 内存压力恢复：iOS 警告或严重内存压力时释放转换帧、像素池和 VideoToolbox 会话，下一帧自动重建。
 - 自动重连与看门狗：首帧或后续帧超时时主动重建连接，退避最长 30 秒。
-- 最新帧优先：MJPEG 接收和 JPEG 解码分队列运行，解码器只保留一个最新待解码帧；共享发布也只保留最新待处理帧，避免网络读取被解码阻塞或队列越积越旧。
+- 有界网络队列：直接 OBS 推流先缓冲约 1.5 秒的压缩 JPEG，再按输入帧率送入解码；其他 MJPEG 拉流和共享发布使用最新帧优先，避免积压。
 - 原子化流切换：URL、本地文件或本地方向改变后，旧连接、旧 reader 和旧变换的在途帧会被丢弃。
 - 可配置断流策略：保持最后一帧，或在设定超时后恢复真实相机。
 - rootless 打包，同时构建 `arm64` 和 `arm64e`。
@@ -49,18 +53,26 @@ VirtualCamPro 是面向 **rootless 越狱 iOS 15** 的系统级虚拟摄像头/�
 - 不直接支持 RTSP 或 RTMP URL。可在电脑上转成 HLS 或 MJPEG。
 - 不注册新的 `AVCaptureDevice`，也不伪造相机名称、镜头能力、设备型号或 EXIF。
 - 不包含越狱隐藏、授权绕过、反调试或反分析功能。
-- `BWNodeOutput` 与屏幕渲染入口是 iOS 私有实现。项目只针对 iOS 15.x，在调用前检查类、方法、函数与类型签名；不存在或不匹配时原样放行真实摄像头并自动使用应用层回退。
+- `BWNodeOutput` 与屏幕渲染入口是 iOS 私有实现。在调用前检查类、方法、函数与类型签名；不存在或不匹配时原样放行真实摄像头并自动使用应用层回退。
 
 ## 设备要求
 
-- rootless 越狱 iOS 15.x。
+- rootless 越狱 iOS 15.x 或 16.x；iOS 16 已验证的设备范围见 `IOS16-TEST-STATUS.md`。
 - MobileSubstrate、Substitute 或提供兼容接口的注入框架。
 - PreferenceLoader。
 - 手机和推流电脑网络互通，或自行建立 USB 端口转发。
 
 iPhone 7 Plus（A10）使用 `arm64` slice，项目的默认构建包含该架构。
 
-## 快速使用
+## 直接接收 OBS 画面
+
+1. 手机“设置 → VirtualCamPro”选择网络来源，URL 填 `http://0.0.0.0:8890/obs` 并启用替换。这个地址表示手机监听本机的 8890 端口。
+2. OBS 中依次打开“设置 → 输出”，将输出模式设为“高级”，在“录制”中选择“自定义输出 (FFmpeg)”和“输出到 URL”。
+3. OBS URL 填 `http://手机局域网IP:8890/obs`，容器格式选 `mpjpeg`，视频编码器选 `mjpeg`，音频编码器选“禁用编码器”，混流器设置留空。点击“开始录制”，再打开手机相机。
+
+手机一次接收一个推流连接；OBS 断开后可重新连接。直接推流会在手机端缓冲约 1.5 秒的压缩画面，以减小网络抖动对录像的影响；接收队列有内存和帧数上限。画面分辨率与帧率由 OBS 决定，麦克风仍由 iPhone 提供。该 HTTP 端口没有认证，请在可信网络中使用。
+
+## 其他使用方式
 
 1. 下载或进入 [`VirtualCamPro-Windows-Control-Center/`](VirtualCamPro-Windows-Control-Center/)，先运行 `standalone-self-test.bat`，再双击 `VirtualCamPro-Windows控制中心.bat`，点“环境预检”和“一键部署到手机”。完整步骤见[最新部署教程](VirtualCamPro-Windows-Control-Center/DEPLOYMENT.md)。
 2. 在 Windows 上安装 FFmpeg 和 OBS Studio。在控制中心点“诊断 OBS 桥接”，或在独立目录运行 `start-obs-vcam.bat --check`；确认通过后点“启动 OBS 桥接”或双击 `start-obs-vcam.bat`。工具会验证 Virtual Camera 确实输出帧，实测软件/可用硬件编码余量，再按 OBS 保存的画布和 FPS（例如 1920×1080@60）建立 MJPEG 服务。
@@ -90,7 +102,7 @@ iPhone 7 Plus（A10）使用 `arm64` slice，项目的默认构建包含该架�
 
 正常情况下只需在 OBS 保存视频设置后双击 `start-obs-vcam.bat`，脚本会自动读取，不需要再执行 `--check FPS`。临时覆盖时仍可运行 `start-obs-vcam.bat 29.97`。网络 FPS、画质、分辨率和方向完全由 OBS/FFmpeg 输出决定，手机设置中的 FPS/质量/旋转/镜像只属于本地文件来源。
 
-网络预览方向不正确时请直接在 OBS 场景或 Windows 输出画布中修正；手机不会二次旋转或镜像网络帧。本地文件方向不正确时才使用 VirtualCamPro 的本地旋转/镜像设置。
+网络画面按输入比例保持横向或竖向。iOS 16 的直接 OBS 推流会针对前摄的系统相机管线做方向校正；场景内容方向仍可在 OBS 中调整。本地文件方向使用 VirtualCamPro 的本地旋转/镜像设置。
 
 FFmpeg 的简易 MJPEG HTTP 输出一次只服务一个连接。需要多客户端或更稳定的 OBS 工作流时，推荐使用 SRS/MediaMTX 接收 OBS 的 RTMP 并输出 HLS，再填写 `http://电脑IP:端口/live/name.m3u8`。
 
@@ -108,18 +120,13 @@ FFmpeg 的简易 MJPEG HTTP 输出一次只服务一个连接。需要多客户�
 
 ## 项目结构
 
-- `MediaServer.x`：系统相机图低层注入。
-- `Tweak.x`：应用层自动回退注入。
-- `VCSharedMediaBus.*`：跨进程 IOSurface 视频与 PCM 音频总线。
-- `VCScreenCaptureSource.*`：SpringBoard 屏幕 IOSurface 生产者。
-- `VCLocalMediaSource.*`：本地视频/音频统一时间线读取。
-- `VCAudioSampleConverter.*`：按真实麦克风 ASBD 与时间戳重建 PCM。
-- `AVAssetStreamAdapter.*`：HLS/MJPEG 接收、VideoToolbox JPEG 快路径、ImageIO 回退、丢帧遥测与重连。
-- `VCJPEGParser.h`：可独立测试的增量 JPEG 帧边界解析器。
-- `VCFrameConverter.*`：VideoToolbox 像素格式、尺寸和比例转换。
-- `VCPreferences.*`：统一偏好读取与校验。
-- `VCStreamCoordinator.*`：SpringBoard 单生产者与各进程只读消费者协调。
+- `src/`：相机 Hook、媒体接收、跨进程总线、格式转换和偏好实现。
+- `src/MediaServer.x`、`src/Tweak.x`：系统相机图注入和应用层回退。
+- `src/AVAssetStreamAdapter.*`、`src/VCMJPEGPushServer.*`：网络画面接收与解码。
+- `src/VCFrameConverter.*`、`src/VCSharedMediaBus.*`：相机像素转换和跨进程媒体总线。
 - `prefs/`：PreferenceLoader 设置面板。
+- `tests/`：JPEG 解析、HTTP 分块、缓冲策略及媒体协议测试。
+- `layout/`、`control`、`Makefile`：rootless 安装布局与构建配置。
 - `scripts/validate_project.py`：项目结构与配置一致性检查。
 - `VirtualCamPro-Windows-Control-Center/`：可直接下载使用的独立 Windows 控制中心源码，包含 GUI、CLI、部署教程和完整性验证；安装包从同一提交的 `VirtualCamPro-rootless` Actions artifact 获取。
 - `VirtualCamPro-Windows-Control-Center/scripts/`：Windows 预检、OBS 控制、FFmpeg 推流、手机安装与验证核心工具。

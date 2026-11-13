@@ -27,7 +27,7 @@
             <key>label</key><string>替换来源</string>
             <key>validTitles</key>
             <array>
-                <string>网络 HLS / MJPEG</string>
+                <string>网络 HLS / MJPEG / OBS 推流</string>
                 <string>设备屏幕实时镜像</string>
                 <string>手机本地视频 / 音频</string>
             </array>
@@ -51,7 +51,7 @@
             <key>cell</key><string>PSGroupCell</string>
             <key>label</key><string>网络流</string>
             <key>vcSourceTypes</key><array><integer>0</integer></array>
-            <key>footerText</key><string>推荐使用 MJPEG 获得最低延迟。手机只解码发送端完整帧，所有画面参数由 Windows/OBS 发送端决定。</string>
+            <key>footerText</key><string>OBS 直接推流时，手机 URL 填 http://0.0.0.0:8890/obs；OBS 输出 URL 使用手机的局域网 IP。仅传输画面，麦克风保持原样。</string>
         </dict>
         <dict>
             <key>cell</key><string>PSEditTextCell</string>
@@ -59,7 +59,7 @@
             <key>defaults</key><string>com.murkaska.virtualcampro</string>
             <key>key</key><string>streamURL</string>
             <key>label</key><string>网络流 URL</string>
-            <key>placeholder</key><string>http://192.168.1.10:8888/live.mjpg</string>
+            <key>placeholder</key><string>http://0.0.0.0:8890/obs</string>
             <key>vcSourceTypes</key><array><integer>0</integer></array>
             <key>PostNotification</key><string>com.murkaska.virtualcampro/preferences.changed</string>
         </dict>

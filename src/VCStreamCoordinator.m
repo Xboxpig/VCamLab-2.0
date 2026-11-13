@@ -3,6 +3,7 @@
 #import "AVAssetStreamAdapter.h"
 #import "VCFrameConverter.h"
 #import "VCLocalMediaSource.h"
+#import "VCOBSPushURL.h"
 #import "VCPreferences.h"
 #import "VCScreenCaptureSource.h"
 #import "VCSharedMediaBus.h"
@@ -30,6 +31,7 @@ typedef NS_ENUM(uint64_t, VCStreamStatus) {
     BOOL _replacementEnabled;
     BOOL _producerProcess;
     VCSourceType _configuredSourceType;
+    BOOL _configuredOBSPushSource;
     NSInteger _configuredFPS;
     CGFloat _configuredJPEGQuality;
     BOOL _configuredAspectFill;
@@ -338,6 +340,7 @@ static void VCPreferencesDidChange(CFNotificationCenterRef center,
         if (transformChanged) _transformGeneration++;
         _replacementEnabled = enabled;
         _configuredSourceType = sourceType;
+        _configuredOBSPushSource = sourceType == VCSourceTypeNetwork && VCURLIsOBSPush(networkURL);
         _configuredFPS = effectiveFPS;
         _configuredJPEGQuality = effectiveJPEGQuality;
         _configuredAspectFill = effectiveAspectFill;
@@ -764,6 +767,13 @@ static void VCPreferencesDidChange(CFNotificationCenterRef center,
     BOOL enabled = _replacementEnabled;
     os_unfair_lock_unlock(&_stateLock);
     return enabled;
+}
+
+- (BOOL)isOBSPushSource {
+    os_unfair_lock_lock(&_stateLock);
+    BOOL value = _configuredOBSPushSource;
+    os_unfair_lock_unlock(&_stateLock);
+    return value;
 }
 
 - (NSInteger)preferredFPS {

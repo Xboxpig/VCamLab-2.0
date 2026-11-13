@@ -1,4 +1,4 @@
-#include "../VCSharedMediaProtocol.h"
+#include "../src/VCSharedMediaProtocol.h"
 
 #include <assert.h>
 #include <stdio.h>

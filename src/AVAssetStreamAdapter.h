@@ -6,6 +6,7 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSInteger, VCStreamProtocol) {
     VCStreamProtocolHLS,
     VCStreamProtocolMJPEG,
+    VCStreamProtocolOBSPush,
 };
 
 typedef void (^AVAssetPixelBufferCallback)(CVPixelBufferRef buffer);

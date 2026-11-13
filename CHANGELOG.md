@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.24.3
+
+- 将 rootless 安装范围扩展到 iOS 16，并增加直接接收 OBS HTTP MJPEG 推流的方式。
+- 支持录像路径中的 10 位与压缩 YCbCr 格式，修复转换缓存占满像素缓冲池后画面恢复真实相机的问题。
+- 直接 OBS 推流在解码前缓存约 1.5 秒的 JPEG，按输入帧率平滑播放；录像缓冲池按帧大小和活跃格式调整容量。
+- iOS 16 系统相机前摄的 OBS 画面进行方向校正；JPEG 硬解码会话失效时立即重建并重试。
+- 限制动态类扫描遍历已分配的数组，避免并发注册新类时越界。
+- 为 Procursus clang 的 arm64e 类、常量字符串、block 与栈 block 指针认证提供可选构建修复。
+
 ## 2.24.2 - 2026-08-15
 
 - Fixed a concrete iOS 15.8.8 shared-frame false-stale failure. Every consumer now maintains freshness in its own monotonic-clock domain and refreshes that observation when the published generation advances or SpringBoard's packed producer-runtime state changes. A zero, future or temporarily stuck direct timestamp can no longer hide an actively published global IOSurface, while a genuinely stopped producer still ages out under the configured policy.

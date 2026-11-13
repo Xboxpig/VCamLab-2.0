@@ -11,6 +11,7 @@
 #import <substrate.h>
 #import <float.h>
 #import <math.h>
+#import <string.h>
 
 #import "VCAudioSampleConverter.h"
 #import "VCFrameConverter.h"
@@ -69,6 +70,11 @@ static dispatch_once_t VCHookUnavailableLogToken;
 static CFStringRef const VCReplacedSampleAttachmentKey =
     CFSTR(VC_SYSTEM_REPLACEMENT_ATTACHMENT_KEY);
 static char VCAudioReplacementContextAssociationKey;
+static char VCCameraGraphPositionAssociationKey;
+static void (*VCOriginalCameraPositionSet)(id, SEL, int) = NULL;
+static void (*VCOriginalCameraPositionPrepare)(id, SEL) = NULL;
+static SEL VCCameraGraphSelector = NULL;
+static SEL VCCameraNodeSelector = NULL;
 static const NSUInteger VCMaximumVolumeHooks = 96;
 static VCVolumeHookEntry VCVolumeHookEntries[96];
 static _Atomic(uint32_t) VCVolumeHookCount = 0;
@@ -383,8 +389,11 @@ static void VCScanLoadedVolumeClasses(void) {
     Class __unsafe_unretained *classes =
         (__unsafe_unretained Class *)calloc((size_t)classCount, sizeof(Class));
     if (!classes) return;
-    classCount = objc_getClassList(classes, classCount);
-    for (int classIndex = 0; classIndex < classCount; classIndex++) {
+    int populated = objc_getClassList(classes, classCount);
+    // Classes may be registered between the size query and the copy. The
+    // runtime may report the new total, which can exceed our allocation.
+    int copiedCount = MIN(populated, classCount);
+    for (int classIndex = 0; classIndex < copiedCount; classIndex++) {
         Class runtimeClass = classes[classIndex];
         NSString *className = NSStringFromClass(runtimeClass).lowercaseString;
         if (![className containsString:@"volume"]) continue;
@@ -478,6 +487,66 @@ static BOOL VCNodeOutputIsVideo(id object) {
 static BOOL VCNodeOutputIsAudio(id object) {
     if (!VCMediaServerCanQueryAudioMediaType || !VCMediaTypeIsAudioSelector) return YES;
     return ((BOOL (*)(id, SEL))objc_msgSend)(object, VCMediaTypeIsAudioSelector);
+}
+
+static void VCAssociateCameraPosition(id node, int position) {
+    if (!node || !VCCameraGraphSelector) return;
+    id graph = ((id (*)(id, SEL))objc_msgSend)(node, VCCameraGraphSelector);
+    if (graph) objc_setAssociatedObject(graph, &VCCameraGraphPositionAssociationKey,
+                                        @(position), OBJC_ASSOCIATION_RETAIN);
+}
+
+static void VCCameraPositionSetHook(id node, SEL selector, int position) {
+    if (VCOriginalCameraPositionSet) VCOriginalCameraPositionSet(node, selector, position);
+    VCAssociateCameraPosition(node, position);
+}
+
+static void VCCameraPositionPrepareHook(id node, SEL selector) {
+    if (VCOriginalCameraPositionPrepare) VCOriginalCameraPositionPrepare(node, selector);
+    int position = ((int (*)(id, SEL))objc_msgSend)(node, sel_registerName("sourcePosition"));
+    VCAssociateCameraPosition(node, position);
+}
+
+static BOOL VCMethodHasEncoding(Method method, const char *expected) {
+    const char *encoding = method ? method_getTypeEncoding(method) : NULL;
+    return encoding && strcmp(encoding, expected) == 0;
+}
+
+static void VCInstallCameraPositionHooks(void) {
+    if (VCOriginalCameraPositionSet && VCOriginalCameraPositionPrepare) return;
+    Class positionClass = objc_getClass("BWVideoOrientationMetadataNode");
+    Class outputClass = objc_getClass("BWNodeOutput");
+    Class nodeClass = objc_getClass("BWNode");
+    if (!positionClass || !outputClass || !nodeClass) return;
+    SEL setter = sel_registerName("setSourcePosition:");
+    SEL prepare = sel_registerName("prepareForCurrentConfigurationToBecomeLive");
+    SEL graph = sel_registerName("graph");
+    SEL node = sel_registerName("node");
+    if (!VCMethodHasEncoding(class_getInstanceMethod(positionClass, setter), "v20@0:8i16") ||
+        !VCMethodHasEncoding(class_getInstanceMethod(positionClass, prepare), "v16@0:8") ||
+        !VCMethodHasEncoding(class_getInstanceMethod(positionClass, sel_registerName("sourcePosition")), "i16@0:8") ||
+        !VCMethodHasEncoding(class_getInstanceMethod(nodeClass, graph), "@16@0:8") ||
+        !VCMethodHasEncoding(class_getInstanceMethod(outputClass, node), "@16@0:8")) return;
+    VCCameraGraphSelector = graph;
+    VCCameraNodeSelector = node;
+    if (!VCOriginalCameraPositionSet) {
+        MSHookMessageEx(positionClass, setter, (IMP)VCCameraPositionSetHook,
+                        (IMP *)&VCOriginalCameraPositionSet);
+    }
+    if (!VCOriginalCameraPositionPrepare) {
+        MSHookMessageEx(positionClass, prepare, (IMP)VCCameraPositionPrepareHook,
+                        (IMP *)&VCOriginalCameraPositionPrepare);
+    }
+}
+
+static BOOL VCNodeOutputUsesFrontCamera(id output) {
+    if (!VCCameraNodeSelector || !VCCameraGraphSelector) return NO;
+    id node = ((id (*)(id, SEL))objc_msgSend)(output, VCCameraNodeSelector);
+    if (!node) return NO;
+    id graph = ((id (*)(id, SEL))objc_msgSend)(node, VCCameraGraphSelector);
+    NSNumber *position = graph ? objc_getAssociatedObject(graph, &VCCameraGraphPositionAssociationKey) : nil;
+    // AVCaptureDevicePositionFront is 2; an unknown graph keeps the original orientation.
+    return position.intValue == 2;
 }
 
 static VCAudioReplacementContext *VCAudioContextForNode(id object) {
@@ -612,15 +681,20 @@ static void VCMediaServerEmitSampleBuffer(id object, SEL selector, CMSampleBuffe
                 originalEmit(object, selector, originalBuffer);
                 return;
             }
+            CVPixelBufferRef frontSource = NULL;
+            if (coordinator.isOBSPushSource && VCNodeOutputUsesFrontCamera(object)) {
+                frontSource = VCCopyFrontCameraPixelBuffer(source);
+            }
             CMSampleBufferRef replacement = VCCopyReplacementSampleBuffer(originalBuffer,
-                                                                           source,
+                                                                           frontSource ?: source,
                                                                            aspectFill,
                                                                            preferredFPS);
+            if (frontSource) CVPixelBufferRelease(frontSource);
             VCReleaseSharedVideoPixelBuffer(source);
             if (!replacement) {
                 VCReportMediaServerVideoRuntimeEvent(
                     VCMediaServerVideoRuntimeConversionFailed,
-                    0);
+                    (uint8_t)VCFrameConversionLastFailure());
                 dispatch_once(&VCConversionFailureLogToken, ^{
                     NSLog(@"[VirtualCamPro] System video conversion failed for %zux%zu/%u; fail-open",
                           CVPixelBufferGetWidth(originalPixelBuffer),
@@ -762,6 +836,9 @@ static void VCScheduleMediaServerHookRetry(NSUInteger attempt,
 }
 
 static void VCInstallMediaServerHook(NSUInteger attempt) {
+    if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 16) {
+        VCInstallCameraPositionHooks();
+    }
     VCReportMediaServerVideoRuntimeEvent(
         VCMediaServerVideoRuntimeScanning,
         (uint8_t)MIN(attempt, (NSUInteger)UINT8_MAX));
@@ -786,7 +863,8 @@ static void VCInstallMediaServerHook(NSUInteger attempt) {
                 (__unsafe_unretained Class *)calloc((size_t)classCount,
                                                      sizeof(Class));
             int populated = classes ? objc_getClassList(classes, classCount) : 0;
-            for (int index = 0; index < populated; index++) {
+            int copiedCount = MIN(populated, classCount);
+            for (int index = 0; index < copiedCount; index++) {
                 Class candidate = classes[index];
                 if (candidate != nodeOutputClass &&
                     VCClassIsSubclassOfClass(candidate, nodeOutputClass)) {

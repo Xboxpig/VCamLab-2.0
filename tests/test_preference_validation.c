@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "../VCPreferenceValidation.h"
+#include "../src/VCPreferenceValidation.h"
 
 static void test_integer_boundaries(void) {
     int64_t value = -1;

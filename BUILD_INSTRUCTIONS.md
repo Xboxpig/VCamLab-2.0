@@ -9,7 +9,16 @@ Windows 无法直接使用 Xcode 的新 arm64e ABI 链接器，因此完整的 `
 3. 构建成功后下载 `VirtualCamPro-rootless` artifact。
 4. 解压后得到 `.deb`、`SHA256SUMS` 和记录源码/Theos/SDK 提交的 `build-metadata.txt`。
 
+GitHub Actions 构建与下面的 Procursus 构建使用不同工具链；iOS 16.6 实机验证的是后者，Actions 产物仍需在目标设备上验证。
+
 `Source validation` 会同时运行带 ASan/UBSan 的 C 协议测试、Shell 配置自检、PowerShell 5.1/WinForms/FFmpeg 深度自检，并重建不捆绑旧 iOS 二进制的 Windows 独立工具。所有第三方 Actions 都固定到完整提交 SHA，工作流只授予 `contents: read`。
+
+本地可使用以下命令运行全部便携测试（包含 HTTP 分块、MJPEG 缓冲策略和 arm64e block 签名测试）：
+
+```bash
+python3 scripts/validate_project.py
+python3 scripts/run_portable_tests.py
+```
 
 ## macOS 本地构建
 
@@ -20,8 +29,15 @@ export THEOS="$HOME/theos"
 make clean
 python3 scripts/validate_project.py
 make package FINALPACKAGE=1
-bash scripts/verify_deb.sh packages/com.murkaska.virtualcampro_2.24.2_iphoneos-arm64.deb
+bash scripts/verify_deb.sh packages/com.murkaska.virtualcampro_2.24.3_iphoneos-arm64.deb
 ```
+
+使用 Procursus clang/ld64 在 iOS 16 arm64e 设备上构建时，可使用
+`make package FINALPACKAGE=1 VC_ARM64E_FIXUPS=1` 修正类、常量字符串和
+block 的 arm64e 指针后重新签名。该选项使用 Python 包装 clang；需要时可通过
+`VC_REAL_CLANG` 指定实际 clang 的路径。不要将编译通过视为
+相机功能通过。后处理脚本改编自 LSTimeSeconds iOS 17 port，许可证见
+`scripts/patch_arm64e.LICENSE`。
 
 仅为 iPhone 7 Plus/A10 构建时，可临时减少到 arm64：
 
@@ -38,7 +54,7 @@ make package FINALPACKAGE=1 ARCHS=arm64
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-windows-standalone.ps1 `
-  -PackagePath "D:\Packages\com.murkaska.virtualcampro_2.24.2_iphoneos-arm64.deb" `
+  -PackagePath "D:\Packages\com.murkaska.virtualcampro_2.24.3_iphoneos-arm64.deb" `
   -CreateZip
 ```
 
@@ -73,7 +89,7 @@ install-phone.bat --setup PHONE_IP
 也可以把 `.deb` 完整路径作为第二个参数、SSH 端口作为第三个参数：
 
 ```bat
-install-phone.bat PHONE_IP "D:\Downloads\com.murkaska.virtualcampro_2.24.2_iphoneos-arm64.deb" 22
+install-phone.bat PHONE_IP "D:\Downloads\com.murkaska.virtualcampro_2.24.3_iphoneos-arm64.deb" 22
 ```
 
 工具固定使用 Windows OpenSSH 的交互式密码提示，不接收或保存密码。复制后还会核对上传字节数，并用手机端 `dpkg-deb` 验证包内 ID、版本和架构；安装后要求已安装版本精确一致，随后删除 `/var/mobile` 中的临时上传。默认用户是 `mobile`；可通过 `VCAM_PHONE_USER`、`VCAM_PHONE_PORT`、`VCAM_PHONE_HOST` 和 `VCAM_DEB_PATH` 环境变量覆盖。
